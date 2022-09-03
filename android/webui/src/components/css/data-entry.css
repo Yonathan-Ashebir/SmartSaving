@@ -1,0 +1,22 @@
+.data-entry {
+    display: flex;
+    flex-flow: row nowrap;
+    width: 100%;
+    align-items: center;
+    justify-content: space-between;
+    padding: 2mm 3mm;
+    width: 100%;
+    box-sizing: border-box;
+}
+
+
+.data-entry> .label{
+    font-size: 1em;
+    margin: 2mm 8mm 2mm 2mm;
+    font-family: 'GRADUATE';
+    font-weight: 700;
+}
+
+.data-entry > .data{
+    overflow: hidden
+}
