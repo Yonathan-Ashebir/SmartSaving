@@ -1,0 +1,3 @@
+> Finalizeing arduino sketch -done
+> Generating hex files and related binaries -done
+> Designing PCP and Electrical layouts -done
