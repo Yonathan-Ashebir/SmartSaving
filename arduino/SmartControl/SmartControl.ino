@@ -11,12 +11,14 @@ const byte UPLOAD_DELAY_MS = 100;
 const byte SYNC_DELAY_MS = 10;
 const unsigned int SYNC_INTERVALS_MS = 5 * 60;
 const byte EVENT_WIDTH_MINS = 2;
-const unsigned int CUSTOM_TO_UNIX = DateTime(2020, 0, 1, 0, 0, 0).unixtime();
+const unsigned long int CUSTOM_TO_UNIX = DateTime(2020, 0, 1, 0, 0, 0).unixtime();
 const byte BLUETOOTH_KEY_PIN = 4;
 const byte BLUETOOTH_TX_PIN = 3;
 const byte BLUETOOTH_RX_PIN = 2;
+const byte BLUETOOTH_RESET_PIN = A3;
 const byte RTC_SDA_PIN = A4;
 const byte RTC_SCL_PIN = A5;
+const byte POWER_CHECK_PIN = A7;
 const unsigned REFRESH_INTERVAL_MS = 20000;
 
 struct DayTime {
@@ -29,22 +31,20 @@ struct DayTime {
 };
 
 struct Flags {
-  long dirty:32;
+  long dirty : 32;
 };
 
 struct Timeout {  //info: size = 4 byte
 private:
-  unsigned int customTime : 16;
-  byte hours : 5;
-  byte minutes : 6;
-  byte port : 4;
+  unsigned long int customTime : 23;
+  byte port : 5;
   bool state : 1;
 public:
-  unsigned int getUnixtime() {
-    return this->customTime + CUSTOM_TO_UNIX;
+  unsigned long int getUnixtime() {
+    return this->customTime * 60l + CUSTOM_TO_UNIX;
   }
-  DayTime getDayTime() {
-    return DayTime(this->hours, this->minutes);
+  DateTime getDateTime() {
+    return DateTime(getUnixtime());
   }
   unsigned int getPort() {
     return this->port;
@@ -52,12 +52,13 @@ public:
   bool getState() {
     return this->state;
   }
-  void setUnixtime(int unixtime) {
-    this->customTime = unixtime - CUSTOM_TO_UNIX;
+  void setUnixtime(unsigned long int unixtime) {
+    Serial.println(String("> Timout's unix is set to: " + customTime));
+    this->customTime = round((signed long int)(unixtime - CUSTOM_TO_UNIX) / 60);
+    Serial.println(String("> Timout's unix is set to: ")+ customTime+" from input of "+unixtime);
   }
-  void setDayTime(DayTime dayTime) {
-    hours = dayTime.hours;
-    minutes = dayTime.minutes;
+  void setDateTime(DateTime dateTime) {
+    setUnixtime(dateTime.unixtime());
   }
   void setPort(int port) {
     this->port = port;
@@ -123,19 +124,19 @@ struct Scheduled {  //info: size = 6 bytes
 private:
   byte customTime1;
   byte customTime2;
-  byte port : 4;
+  byte customTime3 : 7;
   bool state : 1;
-  byte hours : 5;
-  byte minutes : 6;
+  byte port : 4;
   byte count = 0;  //255 means loop
   byte intervalDays = 1;
 public:
-  unsigned int getUnixtime() {
-    return CUSTOM_TO_UNIX + (customTime1 | (customTime2 << 8));
+  unsigned long int getUnixtime() {
+    return ((unsigned long int)customTime1 | (unsigned long int)customTime2 << 8 || (unsigned long int)customTime3 << 16) * 60l + CUSTOM_TO_UNIX;
   }
-  DayTime getDayTime() {
-    return DayTime(this->hours, this->minutes);
+  DateTime getDateTime() {
+    return DateTime(getUnixtime());
   }
+
   unsigned int getPort() {
     return this->port;
   }
@@ -148,15 +149,14 @@ public:
   unsigned int getIntervalDays() {
     return this->intervalDays;
   }
-
-  void setUnixtime(unsigned int unixtime) {
-    unsigned int customTime = unixtime - CUSTOM_TO_UNIX;
-    this->customTime1 = 0xff & customTime;
-    this->customTime2 = 0xff00 & customTime;
+  void setUnixtime(unsigned long int unixtime) {
+    unsigned long int customTime = round((signed int)(unixtime - CUSTOM_TO_UNIX) / 60);
+    customTime1 = 0xff & customTime;
+    customTime2 = 0xff & customTime >> 8;
+    customTime3 = 0xff & customTime >> 16;
   }
-  void setDayTime(DayTime dayTime) {
-    this->hours = dayTime.hours;
-    minutes = dayTime.minutes;
+  void setDateTime(DateTime dateTime) {
+    setUnixtime(dateTime.unixtime());
   }
   void setPort(unsigned int port) {
     this->port = port;
@@ -176,34 +176,26 @@ public:
 
 struct Event {  //info size = 4 bytes
 private:
-  unsigned int customTime : 16;
-  byte hours : 5;
-  byte minutes : 6;
+  unsigned long int customTime : 23;
   byte state : 1;
 public:
-  DayTime getDayTime() {
-    return DayTime(hours, minutes);
+  unsigned long int getUnixtime() {
+    return this->customTime * 60l + CUSTOM_TO_UNIX;
+  }
+  DateTime getDateTime() {
+    return DateTime(getUnixtime());
   }
   bool getState() {
-    return state;
+    return this->state;
   }
-  unsigned int getUnixtime() {
-    return customTime + CUSTOM_TO_UNIX;
+  void setUnixtime(unsigned long int unixtime) {
+    this->customTime = round((signed long int)(unixtime - CUSTOM_TO_UNIX) / 60);
   }
-
-  void setDayTime(DayTime dayTime) {
-    hours = dayTime.hours;
-    minutes = dayTime.minutes;
-  }
-  void setUnixtime(unsigned int unixtime) {
-    customTime = unixtime - CUSTOM_TO_UNIX;
+  void setDateTime(DateTime dateTime) {
+    setUnixtime(dateTime.unixtime());
   }
   void setState(bool state) {
-    if (state) {
-      this->state = 1;
-    } else {
-      this->state = 0;
-    }
+    this->state = state;
   }
 };
 
@@ -225,27 +217,40 @@ LinkedList<Scheduled> schedules;
 Event events[PORTS_COUNT];
 Flags flags;
 unsigned int lastUpdateTime = 0;
-SoftwareSerial bluetooth(BLUETOOTH_RX_PIN, BLUETOOTH_TX_PIN);  //receive pin - 2, transmitting pin -3
-
-class OptimizedProvider { /*TODO: more optimization to reduce call backs to rtc.*/
+// SoftwareSerial bluetooth(BLUETOOTH_RX_PIN, BLUETOOTH_TX_PIN);  //receive pin - 2, transmitting pin -3
+#define bluetooth Serial
+class OptimizedProvider {
+private:
+  unsigned int pingSeconds = 0; /*TODO: more optimization to reduce call backs to rtc.*/
 public:
   DayTime getDayTime() {
-    DateTime now = rtc.now();
+    DateTime now = rtc.now() + TimeSpan(0, 0, 0, pingSeconds);
     DayTime dayTime(now.hour(), now.minute());
     return dayTime;
   }
-  unsigned int getUnixtime() {
-    DateTime now = rtc.now();
+  unsigned long int getUnixtime() {
+    DateTime now = rtc.now() + TimeSpan(0, 0, 0, pingSeconds);
     return now.unixtime();
   }
   unsigned int getDay() {
-    DateTime now = rtc.now();
+    DateTime now = rtc.now() + TimeSpan(0, 0, 0, pingSeconds);
     return now.day();
+  }
+  void setUnixtime(unsigned long int unixtime) {
+    rtc.adjust(unixtime + pingSeconds);
+  }
+  void setDateTime(DateTime dateTime) {
+    rtc.adjust(dateTime + TimeSpan(0, 0, 0, pingSeconds));
+  }
+  void setPingSeconds(unsigned int ping) {
+    pingSeconds = ping;
+  }
+  unsigned int getPingSeconds() {
+    return pingSeconds;
   }
 };
 
 OptimizedProvider time;
-
 
 void setup() {
 #ifndef ESP8266
@@ -256,25 +261,33 @@ void setup() {
   for (int ind = 0; ind < PORTS_COUNT; ind++) {
     pinMode(PORTS[ind], OUTPUT);
   }
+  pinMode(POWER_CHECK_PIN, INPUT);
+  Serial.begin(9600);
   setUpRTC();
   setupBluetooth();
+  Serial.println(String("> On setup ") + 6);
 
   //Now, load data from eeprom
   fetchData();
+  Serial.println("> fetched Data");
   //update state/events
   updateState();
+  Serial.println("> First state update done");
   //excute them.
   excute();
+  Serial.println("> Excuted.");
 }
 
 void loop() {
-  unsigned int currentTime = millis();
+  Serial.println("> At loop");
+  // unsigned int currentTime = millis();
   handleConnection();
-  if (!lastUpdateTime && currentTime - lastUpdateTime > REFRESH_INTERVAL_MS) {
-    lastUpdateTime = currentTime;
-    updateState();
-    excute();
-  }
+  // if (!lastUpdateTime && currentTime - lastUpdateTime > REFRESH_INTERVAL_MS) {
+  //   lastUpdateTime = currentTime;
+  //   updateState();
+  //   excute();
+  // }
+  delay(100);
 }
 
 void setUpRTC() {
@@ -294,16 +307,22 @@ void setUpRTC() {
     // rtc.adjust(DateTime(2014, 1, 21, 3, 0, 0));
   }
   time = OptimizedProvider();
+  DateTime firstCall = rtc.now();
+  DateTime secondCall = rtc.now();
+  time.setPingSeconds((secondCall.unixtime() - firstCall.unixtime()) / 2);
 }
 
 void setupBluetooth() {
   delay(100);
   pinMode(BLUETOOTH_KEY_PIN, OUTPUT);
-  bluetooth.begin(9600);
+  pinMode(BLUETOOTH_RESET_PIN, INPUT_PULLUP);
+  attachInterrupt(BLUETOOTH_RESET_PIN, resetBluetooth, LOW);
+  // bluetooth.begin(9600);
   // digitalWrite(4, HIGH);
 }
 
 void fetchData() {
+  return;
   EEPROM.get(12, flags);
   if (flags.dirty) {
     fixData();
@@ -352,6 +371,7 @@ void fetchData() {
 }
 
 void saveData(int what) {  //todo: dirty flag with in the extra space
+  if (!digitalRead(POWER_CHECK_PIN)) return;
   Flags f;
   memcpy(&f, &flags, 4);
   f.dirty = true;
@@ -392,24 +412,21 @@ void saveData(int what) {  //todo: dirty flag with in the extra space
 }
 
 void updateState() {
-  DayTime dayTime = time.getDayTime();
   unsigned int unixtime = time.getUnixtime();
-  DateTime dateTime = rtc.now();
+  DateTime dateTime(unixtime);
 
   for (int ind = 0; ind < timeouts.size(); ind++) {
     Timeout timeout = timeouts.get(ind);
     Event event = events[timeout.getPort()];
 
-    signed int timeoutDiff = diffTimeOut(timeout, dayTime, unixtime);
+    signed int timeoutDiff = diffTimeOut(timeout, unixtime);
     if (timeoutDiff >= 0) {
-      signed int eventDiff = diffEvent(event, event.getDayTime(), event.getUnixtime());
+      signed int eventDiff = diffEvent(event, dateTime);
       if (eventDiff == -2) {
         event.setUnixtime(timeout.getUnixtime());
-        event.setDayTime(timeout.getDayTime());
         event.setState(timeout.getState());
       } else if (eventDiff > timeoutDiff) {
         event.setUnixtime(timeout.getUnixtime());
-        event.setDayTime(timeout.getDayTime());
         event.setState(timeout.getState());
       }
       timeouts.remove(ind);
@@ -421,7 +438,7 @@ void updateState() {
     Weekly weekly = weeklies.get(ind);
     Event event = events[weekly.getPort()];
 
-    signed int weeklyDiff = diffWeekly(weekly, dayTime, unixtime);
+    signed int weeklyDiff = diffWeekly(weekly, dateTime);
     if (weeklyDiff == -2) {
       weeklies.remove(ind);
       ind--;
@@ -430,15 +447,13 @@ void updateState() {
     }
 
     if (weeklyDiff > 0) {
-      signed int eventDiff = diffEvent(event, event.getDayTime(), event.getUnixtime());
-      DateTime newEventTime = dateTime - TimeSpan(weeklyDiff * 60);
+      signed int eventDiff = diffEvent(event, dateTime);
+      DateTime newEventTime = dateTime - TimeSpan(0, 0, weeklyDiff, 0);
       if (eventDiff == -2) {
         event.setUnixtime(newEventTime.unixtime());
-        event.setDayTime(weekly.getDayTime());
         event.setState(weekly.getState());
       } else if (eventDiff > weeklyDiff) {
         event.setUnixtime(newEventTime.unixtime());
-        event.setDayTime(weekly.getDayTime());
         event.setState(weekly.getState());
       }
     }
@@ -448,19 +463,13 @@ void updateState() {
     Scheduled scheduled = schedules.get(ind);
     Event event = events[scheduled.getPort()];
 
-    DiffValue diffValue = diffScheduled(scheduled, dayTime, unixtime);
+    DiffValue diffValue = diffScheduled(scheduled, dateTime);
     signed int scheduledDiff = diffValue.value;
     if (scheduledDiff == -1) continue;
     if (scheduledDiff > 0) {
-      signed int eventDiff = diffEvent(event, event.getDayTime(), event.getUnixtime());
-      DateTime newEventTime = dateTime - TimeSpan(eventDiff * 60);
-      if (eventDiff == -2) {
-        event.setUnixtime(newEventTime.unixtime());
-        event.setDayTime(scheduled.getDayTime());
-        event.setState(scheduled.getState());
-      } else if (eventDiff > scheduledDiff) {
-        event.setUnixtime(newEventTime.unixtime());
-        event.setDayTime(scheduled.getDayTime());
+      signed int eventDiff = diffEvent(event, dateTime);
+      if (eventDiff == -2 || eventDiff > scheduledDiff) {
+        event.setUnixtime(scheduled.getUnixtime());
         event.setState(scheduled.getState());
       }
       if (diffValue.done) {
@@ -482,53 +491,56 @@ void excute() {
 void handleConnection() {
   bool changed = false;
 start:
-  String line = bluetooth.readStringUntil('\n');
-  line.trim();
+  Serial.println("> Handling connection: ");
+  String line = bluetooth.readStringUntil('\r');
+  Serial.println(String("> Line: ") + line);
   if (String("begin").equals(line)) {
     bluetooth.println("listening");
     bluetooth.setTimeout(3000);
-    line = bluetooth.readStringUntil('\n');
+    line = bluetooth.readStringUntil('\r');
+    Serial.println(String("> Line: ") + line);
     line.trim();
     bluetooth.setTimeout(1000);
     switch (line.toInt()) {
       case 0:
         {
-          line = bluetooth.readStringUntil('\n');
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
           line.trim();
           if (line.equals("timeout")) {
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             signed int ind = 0;
             unsigned int count = 0;
             Timeout timeout;
             while (ind != -1) {
-              unsigned int nextInd = line.indexOf(';', ind);
+              signed int nextInd = line.indexOf(';', ind);
               String entry = line.substring(ind, nextInd);
               if (count == 0) {
-                DateTime datetime(entry.toInt());
-                timeout.setUnixtime(datetime.unixtime());
-                timeout.setDayTime(DayTime(datetime.hour(), datetime.minute()));
+                timeout.setUnixtime(entry.toInt());
               } else if (count == 1) timeout.setPort(entry.toInt());
               else if (count == 2) timeout.setState(entry.toInt());
               count++;
-              ind = nextInd;
+              ind = (nextInd != -1) ? nextInd + 1 : -1;
             }
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             if (line.equals("commit") && count == 3) {
               timeouts.add(timeout);
               bluetooth.println("success");
               break;
             }
-
           } else if (line.equals("weekly")) {
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             signed int ind = 0;
             unsigned int count = 0;
             Weekly weekly;
             while (ind != -1) {
-              unsigned int nextInd = line.indexOf(';', ind);
+              signed int nextInd = line.indexOf(';', ind);
               String entry = line.substring(ind, nextInd);
               if (count == 0) weekly.setDays(entry.toInt());
               else if (count == 1) {
@@ -537,9 +549,10 @@ start:
               } else if (count == 2) weekly.setPort(entry.toInt());
               else if (count == 3) weekly.setState(entry.toInt());
               count++;
-              ind = nextInd;
+              ind = (nextInd != -1) ? nextInd + 1 : -1;
             }
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             if (line.equals("commit") && count == 3) {
               weeklies.add(weekly);
@@ -548,26 +561,26 @@ start:
             }
 
           } else if (line.equals("schedule")) {
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             signed int ind = 0;
             unsigned int count = 0;
             Scheduled schedule;
             while (ind != -1) {
-              unsigned int nextInd = line.indexOf(';', ind);
+              signed int nextInd = line.indexOf(';', ind);
               String entry = line.substring(ind, nextInd);
               if (count == 0) {
-                DateTime dateTime(entry.toInt());
-                schedule.setUnixtime(dateTime.unixtime());
-                schedule.setDayTime(DayTime(dateTime.hour(), dateTime.minute()));
+                schedule.setUnixtime(entry.toInt());
               } else if (count == 1) schedule.setCount(entry.toInt());
               else if (count == 2) schedule.setIntervalDays(entry.toInt());
               else if (count == 3) schedule.setPort(entry.toInt());
               else if (count == 4) schedule.setState(entry.toInt());
               count++;
-              ind = nextInd;
+              ind = (nextInd != -1) ? nextInd + 1 : -1;
             }
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             if (line.equals("commit") && count == 3) {
               schedules.add(schedule);
@@ -580,9 +593,10 @@ start:
         }
       case 1:
         {
-          line = bluetooth.readStringUntil('\n');
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
           line.trim();
-          String ind = bluetooth.readStringUntil('\n');
+          String ind = bluetooth.readStringUntil('\r');
           line.trim();
           if (line.equals("timeout")) {
             timeouts.remove(ind.toInt());
@@ -599,29 +613,31 @@ start:
         }
       case 2:
         {
-          line = bluetooth.readStringUntil('\n');
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
           line.trim();
           if (line.equals("timeout")) {
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             signed int ind = 0;
             unsigned int count = 0;
             Timeout timeout = timeouts.get(line.toInt());
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             while (ind != -1) {
-              unsigned int nextInd = line.indexOf(';', ind);
+              signed int nextInd = line.indexOf(';', ind);
               String entry = line.substring(ind, nextInd);
               if (count == 0) {
-                DateTime datetime(entry.toInt());
-                timeout.setUnixtime(datetime.unixtime());
-                timeout.setDayTime(DayTime(datetime.hour(), datetime.minute()));
+                timeout.setUnixtime(entry.toInt());
               } else if (count == 1) timeout.setPort(entry.toInt());
               else if (count == 2) timeout.setState(entry.toInt());
               count++;
-              ind = nextInd;
+              ind = (nextInd != -1) ? nextInd + 1 : -1;
             }
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             if (line.equals("commit") && count == 3) {
               bluetooth.println("success");
@@ -629,15 +645,17 @@ start:
             }
 
           } else if (line.equals("weekly")) {
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             signed int ind = 0;
             unsigned int count = 0;
             Weekly weekly = weeklies.get(line.toInt());
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             while (ind != -1) {
-              unsigned int nextInd = line.indexOf(';', ind);
+              signed int nextInd = line.indexOf(';', ind);
               String entry = line.substring(ind, nextInd);
               if (count == 0) weekly.setDays(entry.toInt());
               else if (count == 1) {
@@ -646,9 +664,10 @@ start:
               } else if (count == 2) weekly.setPort(entry.toInt());
               else if (count == 3) weekly.setState(entry.toInt());
               count++;
-              ind = nextInd;
+              ind = (nextInd != -1) ? nextInd + 1 : -1;
             }
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             if (line.equals("commit") && count == 3) {
               bluetooth.println("success");
@@ -656,28 +675,29 @@ start:
             }
 
           } else if (line.equals("schedule")) {
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             signed int ind = 0;
             unsigned int count = 0;
             Scheduled schedule = schedules.get(line.toInt());
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             while (ind != -1) {
-              unsigned int nextInd = line.indexOf(';', ind);
+              signed int nextInd = line.indexOf(';', ind);
               String entry = line.substring(ind, nextInd);
               if (count == 0) {
-                DateTime dateTime(entry.toInt());
-                schedule.setUnixtime(dateTime.unixtime());
-                schedule.setDayTime(DayTime(dateTime.hour(), dateTime.minute()));
+                schedule.setUnixtime(entry.toInt());
               } else if (count == 1) schedule.setCount(entry.toInt());
               else if (count == 2) schedule.setIntervalDays(entry.toInt());
               else if (count == 3) schedule.setPort(entry.toInt());
               else if (count == 4) schedule.setState(entry.toInt());
               count++;
-              ind = nextInd;
+              ind = (nextInd != -1) ? nextInd + 1 : -1;
             }
-            line = bluetooth.readStringUntil('\n');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
             line.trim();
             if (line.equals("commit") && count == 3) {
               schedules.add(schedule);
@@ -688,46 +708,15 @@ start:
           bluetooth.println("fail");
           break;
         }
-      case 3:  //connection
+      case 3:  //query timeouts, weeklies and schedules
         {
-          line = bluetooth.readStringUntil('\n');
-          line.trim();
-          if (line == "get") {
-            bluetooth.println((String(getBluetoothName()) + ";" + getBluetoothPassword()).c_str());
-          } else if (line == "set") {
-            line = bluetooth.readStringUntil('\n');
-            line.trim();
-            unsigned int i = line.indexOf(';');
-            setBluetoothName(line.substring(0, i).c_str());
-            setBluetoothPassword(line.substring(i).c_str());
-          } else if (line == "reset") {
-            resetBluetooth();
-          } else {
-            bluetooth.println("failed");
-            break;
-          }
-          bluetooth.println("success");
-          break;
-        }
-      case 4:  //events
-        {
-          line = bluetooth.readStringUntil('\n');
-          line.trim();
-          Event event = events[line.toInt()];
-          line = bluetooth.readStringUntil('\n');
-          line.trim();
-          event.setState(line.toInt());
-          bluetooth.println("success");
-          break;
-        }
-      case 5:  //query
-        {
-          line = bluetooth.readStringUntil('\n');
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
           line.trim();
           if (line.equals("timeout")) {
             for (int i = 0; i < timeouts.size(); i++) {
               Timeout timeout = timeouts.get(i);
-              bluetooth.println(String((timeout.getUnixtime() * 1440 + timeout.getDayTime().hours * 60 + timeout.getDayTime().minutes) * 60) + ";" + timeout.getPort() + ";" + timeout.getState());
+              bluetooth.println(String(timeout.getUnixtime()) + ";" + timeout.getPort() + ";" + timeout.getState());
             }
           } else if (line.equals("weekly")) {
             for (int i = 0; i < weeklies.size(); i++) {
@@ -737,7 +726,7 @@ start:
           } else if (line.equals("schedule")) {
             for (int i = 0; i < schedules.size(); i++) {
               Scheduled schedule = schedules.get(i);
-              bluetooth.println(String((schedule.getUnixtime() * 1440 + schedule.getDayTime().hours * 60 + schedule.getDayTime().minutes) * 60) + ";" + schedule.getPort() + ";" + schedule.getState());
+              bluetooth.println(String(schedule.getUnixtime()) + ";" + schedule.getPort() + ";" + schedule.getState() + ";" + schedule.getCount() + ";" + schedule.getIntervalDays());
             }
           } else {
             bluetooth.println("failed");
@@ -746,19 +735,93 @@ start:
           bluetooth.println("success");
           break;
         }
+      case 4:  //events
+        {
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
+          line.trim();
+          Event event = events[line.toInt()];
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
+          line.trim();
+          event.setState(line.toInt());
+          event.setUnixtime(time.getUnixtime());
+          break;
+        }
+      case 5:  //connection
+        {
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
+          line.trim();
+          if (line == "get") {
+            bluetooth.println((String(getBluetoothName()) + ";" + getBluetoothPassword()).c_str());
+          } else if (line == "set") {
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
+            line.trim();
+            unsigned int i = line.indexOf(';');
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
+            if (line.equals("commit")) {
+              if (!setBluetoothName(line.substring(0, i).c_str()) || !setBluetoothPassword(line.substring(i).c_str())) {
+                bluetooth.println("failed");
+                break;
+              }
+            } else {
+              bluetooth.println("failed");
+              break;
+            }
+          } else if (line == "reset") {
+            resetBluetooth();
+          } else {
+            bluetooth.println("failed");
+            break;
+          }
+          bluetooth.println("success");
+          break;
+        }
+      case 6:
+        {
+          line = bluetooth.readStringUntil('\r');
+          Serial.println(String("> Line: ") + line);
+          line.trim();
+          if (line == "get") {
+            bluetooth.println(time.getUnixtime());
+          } else if (line == "set") {
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
+            line.trim();
+            unsigned int unixTime = line.toInt();
+            line = bluetooth.readStringUntil('\r');
+            Serial.println(String("> Line: ") + line);
+            if (line.equals("commit")) {
+              time.setUnixtime(unixTime);
+              bluetooth.println("success");
+              break;
+            }
+          }
+          bluetooth.println("failed");
+          break;
+        }
+      default:
+        {
+          bluetooth.println("failed");
+          break;
+        }
     }
     changed = true;
     lastUpdateTime = 0;
+    Serial.println("> went to start");
     goto start;
   }
-  if (changed) saveData(13);
+  if (changed) saveData(15);
 }
 const char* getBluetoothName() {
   digitalWrite(BLUETOOTH_KEY_PIN, HIGH);
-  bluetooth.print("AT-NAME?");
-  String line = bluetooth.readStringUntil('\n');
+  bluetooth.print("AT-NAME?\r\n");
+  String line = bluetooth.readStringUntil('\r');
   line.trim();
-  if (line.length() == 0) line = bluetooth.readStringUntil('\n');
+  if (line.length() == 0) line = bluetooth.readStringUntil('\r');
   line.trim();
   digitalWrite(BLUETOOTH_KEY_PIN, LOW);
   if (line.length() == 0) return "unknown";
@@ -769,10 +832,10 @@ const char* getBluetoothName() {
 
 const char* getBluetoothPassword() {
   digitalWrite(BLUETOOTH_KEY_PIN, HIGH);
-  bluetooth.print("AT-PSWD?");
-  String line = bluetooth.readStringUntil('\n');
+  bluetooth.print("AT-PSWD?\r\n");
+  String line = bluetooth.readStringUntil('\r');
   line.trim();
-  if (line.length() == 0) line = bluetooth.readStringUntil('\n');
+  if (line.length() == 0) line = bluetooth.readStringUntil('\r');
   line.trim();
   digitalWrite(BLUETOOTH_KEY_PIN, LOW);
   if (line.length() == 0) return "unknown";
@@ -783,10 +846,10 @@ const char* getBluetoothPassword() {
 
 bool setBluetoothName(const char* name) {
   digitalWrite(BLUETOOTH_KEY_PIN, HIGH);
-  bluetooth.print(String("AT-NAME=") + name);
-  String line = bluetooth.readStringUntil('\n');
+  bluetooth.print(String("AT-NAME=") + name + "\r\n");
+  String line = bluetooth.readStringUntil('\r');
   line.trim();
-  if (line.length() == 0) line = bluetooth.readStringUntil('\n');
+  if (line.length() == 0) line = bluetooth.readStringUntil('\r');
   line.trim();
   digitalWrite(BLUETOOTH_KEY_PIN, LOW);
   if (line.equals("OK")) return true;
@@ -795,68 +858,68 @@ bool setBluetoothName(const char* name) {
 
 bool setBluetoothPassword(const char* pass) {
   digitalWrite(BLUETOOTH_KEY_PIN, HIGH);
-  bluetooth.print(String("AT-PSWD=") + pass);
-  String line = bluetooth.readStringUntil('\n');
+  bluetooth.print(String("AT-PSWD=") + pass + "\r\n");
+  String line = bluetooth.readStringUntil('\r');
   line.trim();
-  if (line.length() == 0) line = bluetooth.readStringUntil('\n');
+  if (line.length() == 0) line = bluetooth.readStringUntil('\r');
   line.trim();
   digitalWrite(BLUETOOTH_KEY_PIN, LOW);
   if (line.equals("OK")) return true;
   else return false;
 }
 
-bool resetBluetooth() {
+void resetBluetooth() {
   digitalWrite(BLUETOOTH_KEY_PIN, HIGH);
-  bluetooth.print("AT-ORGL");
-  String line = bluetooth.readStringUntil('\n');
-  line.trim();
-  if (line.length() == 0) line = bluetooth.readStringUntil('\n');
-  line.trim();
-  digitalWrite(BLUETOOTH_KEY_PIN, LOW);
-  if (line.equals("OK")) return true;
-  else return false;
+  bluetooth.print("AT-ORGL\r\n");
+  // String line = bluetooth.readStringUntil('\r');
+  // line.trim();
+  // if (line.length() == 0) line = bluetooth.readStringUntil('\r');
+  // line.trim();
+  // digitalWrite(BLUETOOTH_KEY_PIN, LOW);
+  // if (line.equals("OK")) return true;
+  // else return false;
 }
 
 void fixData() {
-  saveData(13);
+  saveData(15);
 }
 
 void log(String message, unsigned int level) {
-  Serial.println(String("> Level ")+level+": "+message);
+  Serial.println(String("> Level ") + level + ": " + message);
 }
 
-signed int diffTimeOut(Timeout timeout, DayTime dayTime, unsigned int unixtime) {
-  int diff = (unixtime - timeout.getUnixtime()) * 1440 + (dayTime.hours - timeout.getDayTime().hours) * 60 + (dayTime.minutes - timeout.getDayTime().minutes);
+signed int diffTimeOut(Timeout timeout, DateTime now) {
+  int diff = round((signed int)(now.unixtime() - timeout.getUnixtime()) / 60);
   return diff;
 }
 
-signed int diffEvent(Event event, DayTime dayTime, unsigned int unixtime) {
-  DayTime eventDayTime = event.getDayTime();
-  unsigned int eventUnixtime = event.getUnixtime();
-  signed int diff = (unixtime - eventUnixtime) * 1440 + (dayTime.hours - eventDayTime.hours) * 60 + dayTime.minutes - eventDayTime.minutes;
+signed int diffEvent(Event event, DateTime now) {
+  int diff = round((signed int)(now.unixtime() - event.getUnixtime()) / 60);
   if (diff < 0) return -2;  //bad record
   return diff;
 }
 
-signed int diffWeekly(Weekly weekly, DayTime dayTime, unsigned int day) {
-  int diff = (dayTime.hours - weekly.getDayTime().hours) * 60 + (dayTime.minutes - weekly.getDayTime().minutes);
+signed int diffWeekly(Weekly weekly, DateTime now) {
+  DayTime dayTime = weekly.getDayTime();
+  int diff = (now.hour() - dayTime.hours) * 60 + (now.minute() - dayTime.minutes);
   unsigned int diffDays = 0;
-  while (true) {
+  int day = now.day();
+  while (diffDays <= 6) {
     if (weekly.getDay(day)) {
       diff += diffDays * 1440;
+      if (diff < 0) diff += 1440;
       return diff;
     }
-    if (diffDays >= 6) return -2;
     if (day > 0) day--;
     else day = 6;
     diffDays++;
   }
+  return -2;
 }
 
-DiffValue diffScheduled(Scheduled scheduled, DayTime dayTime, unsigned int unixtime) {
-  int diff = (unixtime - scheduled.getUnixtime()) * 1440 + (dayTime.hours - scheduled.getDayTime().hours) * 60 + (dayTime.minutes - scheduled.getDayTime().minutes);
+DiffValue diffScheduled(Scheduled scheduled, DateTime now) {
+  int diff = round((signed int)(now.unixtime() - scheduled.getUnixtime()) / 60);
   if (diff < 0) return DiffValue(-1, false);
-
   unsigned int daysGap = floor(diff / 1440);
   unsigned int count = floor(daysGap / scheduled.getIntervalDays());
   bool lastTime = false;

@@ -1,3 +1,5 @@
-> Finalizeing arduino sketch -done
-> Generating hex files and related binaries -done
-> Designing PCP and Electrical layouts -done
+> Adding missing segments to arduion sketch -done
+> Identify SoftwareSerial and HardwareSerial issues with proteus -done: unknown reason, use serial in exchange
+> Fixing them
+> Fix some bugs with arduino com related code -done
+> Identify proteus can not run issue -done: problematic components or invalid power source
